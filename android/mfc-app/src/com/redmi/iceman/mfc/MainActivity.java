@@ -399,10 +399,46 @@ public class MainActivity extends Activity {
         new Thread(new Runnable() {
             public void run() {
                 try { autopwnFull(startSector, onlySector, fresh); }
-                catch (Exception e) { log("AUTOPWN FAIL: " + e); Log.e(TAG, "autopwn full", e); }
+                catch (Exception e) {
+                    if (isStaleTagError(e)) {
+                        // Android's NFC stack invalidates a Tag's internal
+                        // handle (independent of whether it's still
+                        // physically present) after it's been lost once, a
+                        // reconnect elsewhere, or just enough time passing.
+                        // The cached `lastTag` reference is then permanently
+                        // dead -- only a fresh onTagDiscovered() gets a
+                        // usable one, so clear it rather than let every
+                        // retry fail the same way.
+                        lastTag = null;
+                        setStatus("Tarjeta caducada -- vuelve a acercarla");
+                        log("AUTOPWN: la referencia a la tarjeta ha caducado (\"" + e.getMessage()
+                                + "\"). Separa y vuelve a acercar la tarjeta, luego pulsa el "
+                                + "botón de nuevo (el resultado parcial ya guardado no se pierde).");
+                    } else {
+                        log("AUTOPWN FAIL: " + e);
+                    }
+                    Log.e(TAG, "autopwn full", e);
+                }
                 finally { busy = false; }
             }
         }).start();
+    }
+
+    // Android's NFC framework throws this (as an IOException, message
+    // "Card is out of date" or a TagLostException) when a cached Tag
+    // object's internal service handle no longer matches what NfcService
+    // has for the physically present tag -- happens after a tag is lost
+    // once, or sometimes just from holding a Tag reference across enough
+    // other NFC activity. Re-presenting the card triggers a fresh
+    // onTagDiscovered() with a new, valid Tag; the old reference never
+    // recovers on its own.
+    private static boolean isStaleTagError(Throwable e) {
+        String msg = e.getMessage();
+        String cls = e.getClass().getSimpleName();
+        return (msg != null && (msg.toLowerCase(Locale.US).contains("out of date")
+                || msg.toLowerCase(Locale.US).contains("tag was lost")
+                || msg.toLowerCase(Locale.US).contains("tag has been lost")))
+                || cls.contains("TagLostException");
     }
 
     private void autopwnFull(int startSector, Integer onlySector, boolean fresh) throws Exception {
