@@ -2518,6 +2518,18 @@ static const uint64_t MFC_DEFAULT_KEYS[] = {
 #define MFC_DEFAULT_KEYS_COUNT (sizeof(MFC_DEFAULT_KEYS) / sizeof(MFC_DEFAULT_KEYS[0]))
 
 int mfc_dict_attack(uint8_t block, mfc_key_type_t key_type, uint64_t *found_key_out) {
+    return mfc_dict_attack_ex(block, key_type, NULL, 0, found_key_out);
+}
+
+int mfc_dict_attack_ex(uint8_t block, mfc_key_type_t key_type,
+                        const uint64_t *extra_keys, int extra_count,
+                        uint64_t *found_key_out) {
+    for (int i = 0; i < extra_count; i++) {
+        if (mfc_auth(block, key_type, extra_keys[i]) == 0 /* PM3_SUCCESS */) {
+            if (found_key_out) *found_key_out = extra_keys[i];
+            return 0;
+        }
+    }
     for (size_t i = 0; i < MFC_DEFAULT_KEYS_COUNT; i++) {
         if (mfc_auth(block, key_type, MFC_DEFAULT_KEYS[i]) == 0 /* PM3_SUCCESS */) {
             if (found_key_out) *found_key_out = MFC_DEFAULT_KEYS[i];
@@ -2525,4 +2537,9 @@ int mfc_dict_attack(uint8_t block, mfc_key_type_t key_type, uint64_t *found_key_
         }
     }
     return -1;
+}
+
+uint8_t mfc_sector_first_block(uint8_t sector) {
+    if (sector < 32) return (uint8_t)(sector * 4);
+    return (uint8_t)(128 + (sector - 32) * 16);
 }

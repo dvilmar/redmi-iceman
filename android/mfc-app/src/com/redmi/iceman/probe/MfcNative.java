@@ -30,6 +30,16 @@ public class MfcNative {
     public static native String nativeAutopwn(int block);
 
     /**
+     * Full-card dictionary attack over PTM: Key A + Key B of every sector,
+     * reusing keys already found on earlier sectors before falling back to
+     * the built-in dictionary. One blocking call for the whole card.
+     *
+     * @return String[2*sectorCount]; index 2*s is sector s's Key A (or
+     *         null), 2*s+1 is Key B (or null).
+     */
+    public static native String[] nativeAutopwnAll(int sectorCount);
+
+    /**
      * hardnested: recovers Key B of trgBlock given a known Key A of block.
      * Returns a 12-hex-char key, or null on failure.
      */

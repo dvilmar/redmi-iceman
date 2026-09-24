@@ -147,6 +147,13 @@ public class MainActivity extends Activity {
         addButton(root, "autopwn nativo (un bloque, vía PTM)", new View.OnClickListener() {
             public void onClick(View v) { doAutopwnNative(); }
         });
+        addButton(root, "autopwn nativo (toda la tarjeta, vía PTM)", new View.OnClickListener() {
+            public void onClick(View v) { startAutopwnAllNative(); }
+        });
+        addHint(root, "Igual que el autopwn de la sección 2 pero hablando directo por "
+                + "PTM en vez de la API pública de Android -- debería ser bastante más "
+                + "rápido, sin progreso claves-a-claves (una sola llamada bloqueante "
+                + "para toda la tarjeta). Necesita conectar con PTM arriba.");
 
         // --- 4. Log -------------------------------------------------------
         addHeader(root, "4 · Log");
@@ -664,6 +671,54 @@ public class MainActivity extends Activity {
         } catch (Exception e) {
             return fallback;
         }
+    }
+
+    private void startAutopwnAllNative() {
+        if (busy) { log("hay otra operación en curso, espera..."); return; }
+        if (!ensureMfcReady()) return;
+        // getSectorCount()/getType()/getSize() come from the tag's
+        // discovery-time ATQA/SAK, not a live connection -- safe to read
+        // even though PTM (not reader-mode's MifareClassic) drives the
+        // actual RF here.
+        MifareClassic mfc = MifareClassic.get(lastTag);
+        final int sectorCount = mfc != null ? mfc.getSectorCount() : 16;
+        final int cardType = mfc != null ? mfc.getType() : MifareClassic.TYPE_CLASSIC;
+        final int cardSize = mfc != null ? mfc.getSize() : sectorCount * 64;
+        busy = true;
+        log("AUTOPWN nativo (toda la tarjeta): " + sectorCount + " sectores por PTM, "
+                + "una sola llamada bloqueante -- puede tardar sin progreso intermedio.");
+        setStatus("Autopwn nativo: barriendo " + sectorCount + " sectores por PTM...");
+        new Thread(new Runnable() {
+            public void run() {
+                try {
+                    long start = System.currentTimeMillis();
+                    String[] flat = MfcNative.nativeAutopwnAll(sectorCount);
+                    long elapsedSec = (System.currentTimeMillis() - start) / 1000;
+
+                    SectorKeys[] result = new SectorKeys[sectorCount];
+                    int foundA = 0, foundB = 0;
+                    for (int s = 0; s < sectorCount; s++) {
+                        result[s] = new SectorKeys();
+                        result[s].keyA = flat != null && flat[s * 2] != null ? flat[s * 2] : null;
+                        result[s].keyB = flat != null && flat[s * 2 + 1] != null ? flat[s * 2 + 1] : null;
+                        if (result[s].keyA != null) foundA++;
+                        if (result[s].keyB != null) foundB++;
+                    }
+                    lastResult = result;
+                    log("AUTOPWN nativo hecho en " + (elapsedSec / 60) + "m" + (elapsedSec % 60)
+                            + "s: Key A " + foundA + "/" + sectorCount
+                            + ", Key B " + foundB + "/" + sectorCount);
+                    showAndSaveResult(result, cardType, cardSize);
+                    setStatus("Autopwn nativo hecho: A " + foundA + "/" + sectorCount
+                            + ", B " + foundB + "/" + sectorCount);
+                } catch (Exception e) {
+                    log("AUTOPWN nativo (toda la tarjeta) FAIL: " + e);
+                    Log.e(TAG, "native autopwn all", e);
+                } finally {
+                    busy = false;
+                }
+            }
+        }).start();
     }
 
     private void doAutopwnNative() {

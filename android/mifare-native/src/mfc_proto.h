@@ -79,4 +79,19 @@ void mfc_nested_stop(void);
 // of the dictionary keys work.
 int mfc_dict_attack(uint8_t block, mfc_key_type_t key_type, uint64_t *found_key_out);
 
+// Also tries `extra_keys` (e.g. keys already found on other sectors of the
+// same tag) before falling through to the built-in dictionary -- mirrors
+// the pool-reuse optimization in MainActivity's public-API autopwn sweep.
+// extra_keys may be NULL if extra_count is 0.
+int mfc_dict_attack_ex(uint8_t block, mfc_key_type_t key_type,
+                        const uint64_t *extra_keys, int extra_count,
+                        uint64_t *found_key_out);
+
+// Standard MIFARE Classic sector -> first-block mapping: uniform 4-block
+// sectors 0-31 (all of a 1K card's 16 sectors, and the first 32 of a 4K
+// card's 40), then 16-block sectors 32-39 on a 4K card only. Any block
+// within a sector authenticates the whole sector, so this is enough to
+// drive a per-sector dictionary sweep without needing a full block map.
+uint8_t mfc_sector_first_block(uint8_t sector);
+
 #endif

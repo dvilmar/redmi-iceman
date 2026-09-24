@@ -142,6 +142,47 @@ Java_com_redmi_iceman_probe_MfcNative_nativeAutopwn(JNIEnv *env, jclass clazz, j
     return u64_to_hex_jstring(env, found);
 }
 
+// Full-card autopwn over PTM: sweeps Key A + Key B of every sector,
+// reusing keys already found on earlier sectors first (same optimization
+// as the public-API sweep in MainActivity.autopwnFull()) before falling
+// through to the built-in dictionary. One blocking call for the whole
+// card -- no per-key progress callback into Java, since the entire point
+// of this path is to avoid the per-call Binder/JNI overhead the public
+// android.nfc.tech.MifareClassic API pays on every single key; a callback
+// per key would reintroduce exactly that cost on the fast path this
+// exists to test against.
+//
+// Returns a String[2*sectorCount]: index 2*s is sector s's Key A (or
+// null), 2*s+1 is Key B (or null).
+JNIEXPORT jobjectArray JNICALL
+Java_com_redmi_iceman_probe_MfcNative_nativeAutopwnAll(JNIEnv *env, jclass clazz, jint sectorCount) {
+    (void)clazz;
+    jclass stringClass = (*env)->FindClass(env, "java/lang/String");
+    jobjectArray result = (*env)->NewObjectArray(env, sectorCount * 2, stringClass, NULL);
+
+    uint64_t *pool = (uint64_t *)malloc(sizeof(uint64_t) * (size_t)sectorCount * 2);
+    int pool_n = 0;
+
+    for (jint s = 0; s < sectorCount; s++) {
+        uint8_t block = mfc_sector_first_block((uint8_t)s);
+
+        uint64_t keyA = 0;
+        if (mfc_dict_attack_ex(block, MFC_KEY_A, pool, pool_n, &keyA) == 0) {
+            (*env)->SetObjectArrayElement(env, result, s * 2, u64_to_hex_jstring(env, keyA));
+            pool[pool_n++] = keyA;
+        }
+
+        uint64_t keyB = 0;
+        if (mfc_dict_attack_ex(block, MFC_KEY_B, pool, pool_n, &keyB) == 0) {
+            (*env)->SetObjectArrayElement(env, result, s * 2 + 1, u64_to_hex_jstring(env, keyB));
+            pool[pool_n++] = keyB;
+        }
+    }
+
+    free(pool);
+    return result;
+}
+
 // Command 2/3: hardnested -- recovers Key B of trg_block given a known Key
 // A of block. Runs acquisition (via mfc_nested_*(), driven by the patched
 // acquire_nonces() inside third_party/client_src/cmdhfmfhard.c) followed
