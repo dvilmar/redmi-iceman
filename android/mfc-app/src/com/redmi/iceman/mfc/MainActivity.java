@@ -357,11 +357,17 @@ public class MainActivity extends Activity {
         log("AUTOPWN: diccionario con " + dict.length + " claves");
 
         mfc.connect();
-        try { mfc.setTimeout(1000); } catch (Exception ignore) {}
+        // 1000ms was the Android default and mostly wasted: a wrong-key NAK
+        // (or a right-key ACK) comes back in a few ms at the RF level: the
+        // full second only ever gets spent on a truly dead/absent tag. This
+        // is the main lever on total sweep time for sectors that don't
+        // crack (every failed attempt in a ~3260-key dictionary pays this).
+        try { mfc.setTimeout(300); } catch (Exception ignore) {}
         int sectors = mfc.getSectorCount();
         int size = mfc.getSize();
         log("AUTOPWN: tipo=" + mfc.getType() + " tamaño=" + size + "B sectores=" + sectors);
         setStatus("Autopwn: 0/" + sectors + " sectores");
+        long autopwnStart = System.currentTimeMillis();
 
         SectorKeys[] result = new SectorKeys[sectors];
         for (int i = 0; i < sectors; i++) result[i] = new SectorKeys();
@@ -411,8 +417,9 @@ public class MainActivity extends Activity {
             if (result[s].keyA != null) foundA++; else { missing++; if (firstMissingSector < 0) firstMissingSector = s; }
             if (result[s].keyB != null) foundB++; else { missing++; if (firstMissingSector < 0) firstMissingSector = s; }
         }
-        log("AUTOPWN hecho: Key A " + foundA + "/" + sectors
-                + ", Key B " + foundB + "/" + sectors
+        long elapsedSec = (System.currentTimeMillis() - autopwnStart) / 1000;
+        log("AUTOPWN hecho en " + (elapsedSec / 60) + "m" + (elapsedSec % 60) + "s: Key A "
+                + foundA + "/" + sectors + ", Key B " + foundB + "/" + sectors
                 + ", claves sin romper " + missing);
 
         // "Fallback": what the dictionary could not crack. The raw
@@ -453,17 +460,28 @@ public class MainActivity extends Activity {
         int tried = 0;
         int total = 0;
         for (String ignored : tryOrder) total++;
-        long lastBeat = System.currentTimeMillis();
+        long startTime = System.currentTimeMillis();
+        long lastBeat = startTime;
         for (String hex : tryOrder) {
             tried++;
             // Heartbeat so a stalled sweep is visible: updates the status
             // line every key (cheap) and drops a log line every ~2s so the
             // log itself proves it's alive without flooding it per-key.
+            // Includes measured throughput + ETA so a genuinely slow sweep
+            // (no default key on this sector -> the full ~3260-key
+            // dictionary has to be exhausted) reads as "working, N min
+            // left" instead of looking stuck.
             setStatus("Autopwn: sector " + sectorIdx + "/" + sectorCount
                     + " — Key " + keyLabel + ": " + tried + "/" + total);
             long now = System.currentTimeMillis();
             if (now - lastBeat > 2000) {
-                log("  ... sector " + sectorIdx + " Key " + keyLabel + ": " + tried + "/" + total + " claves probadas");
+                double elapsedSec = (now - startTime) / 1000.0;
+                double perSec = elapsedSec > 0 ? tried / elapsedSec : 0;
+                long etaSec = perSec > 0 ? (long) ((total - tried) / perSec) : -1;
+                log(String.format(Locale.US,
+                        "  ... sector %d Key %s: %d/%d (%.1f claves/s, ETA %dm%02ds)",
+                        sectorIdx, keyLabel, tried, total, perSec,
+                        etaSec < 0 ? 0 : etaSec / 60, etaSec < 0 ? 0 : etaSec % 60));
                 lastBeat = now;
             }
 
