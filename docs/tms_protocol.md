@@ -288,7 +288,53 @@ hardware once `WRITE_SECURE_SETTINGS` is available:
   the hardnested engine) needs to change if the real format turns out to
   be different.
 
-Not yet built: the CLI-facing `hf mf autopwn` UI beyond a single-dictionary
-Key-A recovery (no nested/darkside fallback), and `hf mf value --inc`'s
+## 8. UI: "no detecta la tarjeta" (2026-09-24)
+
+Root cause found in `MainActivity`'s original single "Connect" button: it
+opened PTM (`IHciAdapter.open()`) unconditionally before enabling NFC reader
+mode. Opening PTM takes the THN31 controller out of its normal RF polling
+loop, so `NfcAdapter.ReaderCallback.onTagDiscovered()` stops firing while PTM
+is open — the app looked like it couldn't see any card at all, even a
+perfectly ordinary one, regardless of `WRITE_SECURE_SETTINGS`.
+
+Only `hardnested` actually needs PTM (raw encrypted-nonce + parity capture,
+§4.1 of `research/iceman-hf-mf-command-mapping.md`). The dictionary sweep
+(`autopwn`) and `value --inc` both work over the plain public
+`android.nfc.tech.MifareClassic` API (`Tag.transceive()` under the hood, same
+`[0x60/0x61][block][uid][key]` command TMS's own `TmsM1Tag.authenticate()`
+uses), which needs neither PTM nor `WRITE_SECURE_SETTINGS` and does not
+disturb reader-mode polling.
+
+The app UI was reordered/relabelled around this split (§9) so the
+PTM-required path is opt-in and clearly marked, and the default "Conectar
+(modo lector)" button — the one that actually detects cards — never touches
+PTM.
+
+## 9. UI redesign + full-card autopwn (2026-09-24)
+
+`MainActivity` was restructured into four numbered sections (Conexión /
+Autopwn / Avanzado / Log) and the autopwn flow was extended from "one block,
+Key A only" to a full-card sweep:
+
+- Tries every dictionary key (plus keys already found on the card, tried
+  first) as both Key A and Key B against every sector, not just one block.
+- Logs and keeps a per-sector `SectorKeys[]` result (`lastResult`) in memory
+  for the session, shown as a table and saved as a text report (CSV block +
+  plain unique-key list) under `getExternalFilesDir(null)` (adb-pullable, no
+  extra permission needed).
+- "Fallback" for sectors the dictionary can't crack: when a sector has a
+  known Key A but no Key B (or vice versa), the advanced fields (block,
+  target block, key) are pre-filled and the log points at hardnested as the
+  next step, since a real nested/darkside RF attack needs the same raw
+  nonce+parity capture as hardnested and is blocked on the same PTM/parity
+  unknowns as §7 — there is no public-API equivalent to implement as a true
+  fallback today.
+- This also lays the groundwork asked for as a later step (not implemented
+  yet): once the wire format is confirmed, the saved per-sector Key A can be
+  fed straight into hardnested for a chosen sector, and the recovered Key B
+  straight into `value --inc` on a chosen block, without re-typing anything.
+
+Not yet built: a true nested/darkside RF fallback (needs PTM + the
+still-unresolved parity format, §7), and `hf mf value --inc`'s
 block-copy-to-different-destination TRANSFER variant (current
 `mfc_transfer()` always targets the same block).
