@@ -875,7 +875,13 @@ public class MainActivity extends Activity {
             // whole sector), so the user only needs to type the objective.
             for (int s = 0; s < lastResult.length; s++) {
                 if (lastResult[s].keyA != null) {
-                    autoBlock = MifareClassic.sectorToBlock(s);
+                    // MifareClassic.sectorToBlock() is an instance method
+                    // (needs a connected tag); no tag is required to
+                    // connect for this, so compute the standard mapping
+                    // directly (mirrors mfc_sector_first_block() in
+                    // mfc_dict.c: uniform 4-block sectors 0-31, then
+                    // 16-block sectors 32-39 on 4K cards).
+                    autoBlock = (s < 32) ? s * 4 : 128 + (s - 32) * 16;
                     keyA = lastResult[s].keyA;
                     log("HARDNESTED: usando Key A del sector " + s + " (bloque " + autoBlock
                             + ") como origen, ya conocida por el autopwn previo");
