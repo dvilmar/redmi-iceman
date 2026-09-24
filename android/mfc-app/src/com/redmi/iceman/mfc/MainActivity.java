@@ -68,6 +68,7 @@ public class MainActivity extends Activity {
     private EditText trgBlockInput;
     private EditText keyInput;
     private EditText deltaInput;
+    private EditText sectorInput;
 
     private ITmsNfcAdapter adapter;
     private PtmTransport ptmTransport;
@@ -84,6 +85,12 @@ public class MainActivity extends Activity {
     private SectorKeys[] lastResult;
     private String lastReportText;
     private String lastReportPath;
+    // UID of the tag lastResult belongs to (autopwn resume/single-sector
+    // guard against silently merging keys from a different physical card),
+    // and the sector to continue from after an interrupted sweep (-1 =
+    // nothing pending).
+    private String lastResultUid;
+    private int resumeSector = -1;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -122,6 +129,21 @@ public class MainActivity extends Activity {
         addButton(root, "Autopwn: barrer Key A + Key B de todos los sectores", new View.OnClickListener() {
             public void onClick(View v) { startAutopwnFull(); }
         });
+        addButton(root, "Reanudar autopwn (desde donde se quedó)", new View.OnClickListener() {
+            public void onClick(View v) { startAutopwnResume(); }
+        });
+        addHint(root, "Solo activo si un barrido anterior se cortó (tarjeta separada del "
+                + "móvil a medias). Sigue desde el sector donde se quedó, sin repetir los "
+                + "sectores ya resueltos. Necesita la misma tarjeta (compara el UID).");
+
+        sectorInput = addLabeledInput(root, "Sector específico (vacío = todos), p.ej. 6");
+        addButton(root, "Autopwn: solo este sector", new View.OnClickListener() {
+            public void onClick(View v) { startAutopwnSector(); }
+        });
+        addHint(root, "Sector = bloque / 4 en una tarjeta 1K/4K estándar (p.ej. bloques "
+                + "24-27 → sector 6, bloques 28-31 → sector 7). Actualiza solo ese sector "
+                + "en la tabla, conservando el resto de resultados ya guardados.");
+
         addButton(root, "Mostrar / guardar últimas claves", new View.OnClickListener() {
             public void onClick(View v) { showAndSaveLastResult(); }
         });
@@ -338,6 +360,33 @@ public class MainActivity extends Activity {
     }
 
     private void startAutopwnFull() {
+        // Fresh full sweep: explicitly starts at sector 0 and ignores any
+        // stale partial/previous result even for the same card, since
+        // that's what pressing the main button means.
+        startAutopwnSweep(0, null, true);
+    }
+
+    private void startAutopwnResume() {
+        if (resumeSector < 0) {
+            log("no hay ningún barrido parcial que reanudar -- lanza un autopwn primero");
+            return;
+        }
+        startAutopwnSweep(resumeSector, null, false);
+    }
+
+    private void startAutopwnSector() {
+        String raw = sectorInput.getText().toString().trim();
+        if (raw.isEmpty()) { log("pon un número de sector en «Sector específico», o usa el botón de barrido completo"); return; }
+        int sector;
+        try {
+            sector = Integer.parseInt(raw);
+        } catch (Exception e) {
+            log("«" + raw + "» no es un número de sector válido"); return;
+        }
+        startAutopwnSweep(sector, sector, false);
+    }
+
+    private void startAutopwnSweep(final int startSector, final Integer onlySector, final boolean fresh) {
         if (busy) { log("hay otra operación en curso, espera..."); return; }
         if (!connected) { log("pulsa «Conectar (modo lector)» primero"); return; }
         if (lastTag == null) { log("no hay tarjeta; acerca una y espera a que se detecte"); return; }
@@ -349,19 +398,18 @@ public class MainActivity extends Activity {
         busy = true;
         new Thread(new Runnable() {
             public void run() {
-                try { autopwnFull(); }
+                try { autopwnFull(startSector, onlySector, fresh); }
                 catch (Exception e) { log("AUTOPWN FAIL: " + e); Log.e(TAG, "autopwn full", e); }
                 finally { busy = false; }
             }
         }).start();
     }
 
-    private void autopwnFull() throws Exception {
+    private void autopwnFull(int startSector, Integer onlySector, boolean fresh) throws Exception {
         MifareClassic mfc = MifareClassic.get(lastTag);
         if (mfc == null) { log("la tarjeta no es MifareClassic"); return; }
 
         String[] dict = loadDictionary();
-        log("AUTOPWN: diccionario con " + dict.length + " claves");
 
         mfc.connect();
         // 1000ms was the Android default and mostly wasted: a wrong-key NAK
@@ -372,20 +420,50 @@ public class MainActivity extends Activity {
         try { mfc.setTimeout(300); } catch (Exception ignore) {}
         int sectors = mfc.getSectorCount();
         int size = mfc.getSize();
-        log("AUTOPWN: tipo=" + mfc.getType() + " tamaño=" + size + "B sectores=" + sectors);
-        setStatus("Autopwn: 0/" + sectors + " sectores");
+        String uid = toHex(lastTag.getId());
+
+        // Reuse the previous table (and derive the "already found" pool
+        // from it) instead of starting blank, for resume and single-sector
+        // runs -- but only against the SAME physical card (uid match) and
+        // the same sector count, so a different tag never silently
+        // inherits another tag's keys.
+        SectorKeys[] result;
+        boolean reuse = !fresh && lastResult != null && lastResult.length == sectors
+                && uid.equals(lastResultUid);
+        if (reuse) {
+            result = lastResult;
+        } else {
+            result = new SectorKeys[sectors];
+            for (int i = 0; i < sectors; i++) result[i] = new SectorKeys();
+            if (!fresh && lastResult != null && !uid.equals(lastResultUid)) {
+                log("AVISO: esta tarjeta (uid=" + uid + ") no es la del resultado guardado "
+                        + "(uid=" + lastResultUid + ") -- empezando de cero para lo pedido.");
+            }
+        }
+
+        LinkedHashSet<String> pool = new LinkedHashSet<>();
+        for (SectorKeys sk : result) {
+            if (sk.keyA != null) pool.add(sk.keyA);
+            if (sk.keyB != null) pool.add(sk.keyB);
+        }
+
+        int from = onlySector != null ? onlySector : startSector;
+        int to = onlySector != null ? onlySector + 1 : sectors;
+        if (from < 0 || from >= sectors || to > sectors) {
+            log("AUTOPWN: sector fuera de rango (" + from + ") -- esta tarjeta tiene " + sectors + " sectores (0.." + (sectors - 1) + ")");
+            return;
+        }
+
+        log("AUTOPWN: diccionario con " + dict.length + " claves. tipo=" + mfc.getType()
+                + " tamaño=" + size + "B sectores=" + sectors
+                + (onlySector != null ? " (solo sector " + onlySector + ")"
+                   : from > 0 ? " (reanudando desde sector " + from + ")" : ""));
+        setStatus("Autopwn: " + from + "/" + sectors + " sectores");
         long autopwnStart = System.currentTimeMillis();
 
-        SectorKeys[] result = new SectorKeys[sectors];
-        for (int i = 0; i < sectors; i++) result[i] = new SectorKeys();
-
-        // Try already-known keys first (MIFARE cards very often reuse the
-        // same key across sectors), then the full dictionary. This turns a
-        // multi-minute brute force into seconds on typical cards.
-        LinkedHashSet<String> pool = new LinkedHashSet<>();
-
-        int tagLost = 0;
-        for (int s = 0; s < sectors; s++) {
+        resumeSector = -1; // cleared; re-set below only if this run also gets cut short
+        int stoppedAt = -1;
+        for (int s = from; s < to; s++) {
             setStatus("Autopwn: sector " + s + "/" + sectors);
             log("sector " + s + "/" + sectors + ": probando Key A...");
 
@@ -409,8 +487,9 @@ public class MainActivity extends Activity {
                 // tag removed / halted permanently; reconnect once, else stop.
                 try { mfc.connect(); }
                 catch (Exception e) {
-                    tagLost++;
-                    log("tarjeta perdida en sector " + s + "; guardando resultado parcial");
+                    stoppedAt = s + 1; // resume picks up at the NEXT sector
+                    log("tarjeta perdida en sector " + s + "; guardando resultado parcial -- "
+                            + "acerca la tarjeta de nuevo y pulsa «Reanudar autopwn»");
                     break;
                 }
             }
@@ -418,6 +497,9 @@ public class MainActivity extends Activity {
         try { mfc.close(); } catch (Exception ignore) {}
 
         lastResult = result;
+        lastResultUid = uid;
+        if (stoppedAt >= 0 && stoppedAt < sectors) { resumeSector = stoppedAt; }
+
         int foundA = 0, foundB = 0, missing = 0;
         int firstMissingSector = -1;
         for (int s = 0; s < sectors; s++) {
