@@ -64,7 +64,7 @@ cp "$OUT/app-unsigned.apk" "$WORK/app.apk"
 cp "$OUT/classes.dex" "$WORK/classes.dex"
 mkdir -p "$WORK/lib/arm64-v8a"
 cp lib/arm64-v8a/libmfcbridge.so "$WORK/lib/arm64-v8a/"
-( cd "$WORK" && zip -q app.apk classes.dex lib/arm64-v8a/libmfcbridge.so )
+( cd "$WORK" && zip -X -q app.apk classes.dex lib/arm64-v8a/libmfcbridge.so )
 cp "$WORK/app.apk" "$OUT/app-unsigned.apk"
 
 echo "zipalign ..."
