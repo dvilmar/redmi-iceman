@@ -374,16 +374,18 @@ public class MainActivity extends Activity {
         int tagLost = 0;
         for (int s = 0; s < sectors; s++) {
             setStatus("Autopwn: sector " + s + "/" + sectors);
+            log("sector " + s + "/" + sectors + ": probando Key A...");
 
             LinkedHashSet<String> tryOrder = new LinkedHashSet<>(pool);
             for (String k : dict) tryOrder.add(k);
 
-            result[s].keyA = tryAuthSector(mfc, s, true, tryOrder);
+            result[s].keyA = tryAuthSector(mfc, s, true, tryOrder, s, sectors, "A");
             if (result[s].keyA != null) { pool.add(result[s].keyA); }
 
+            log("sector " + s + "/" + sectors + ": probando Key B...");
             tryOrder = new LinkedHashSet<>(pool);
             for (String k : dict) tryOrder.add(k);
-            result[s].keyB = tryAuthSector(mfc, s, false, tryOrder);
+            result[s].keyB = tryAuthSector(mfc, s, false, tryOrder, s, sectors, "B");
             if (result[s].keyB != null) { pool.add(result[s].keyB); }
 
             log(String.format(Locale.US, "sector %2d: A=%s  B=%s", s,
@@ -446,8 +448,25 @@ public class MainActivity extends Activity {
      * after a failed auth), so a big dictionary sweep survives.
      */
     private String tryAuthSector(MifareClassic mfc, int sector, boolean keyA,
-                                 Iterable<String> tryOrder) {
+                                 Iterable<String> tryOrder,
+                                 int sectorIdx, int sectorCount, String keyLabel) {
+        int tried = 0;
+        int total = 0;
+        for (String ignored : tryOrder) total++;
+        long lastBeat = System.currentTimeMillis();
         for (String hex : tryOrder) {
+            tried++;
+            // Heartbeat so a stalled sweep is visible: updates the status
+            // line every key (cheap) and drops a log line every ~2s so the
+            // log itself proves it's alive without flooding it per-key.
+            setStatus("Autopwn: sector " + sectorIdx + "/" + sectorCount
+                    + " — Key " + keyLabel + ": " + tried + "/" + total);
+            long now = System.currentTimeMillis();
+            if (now - lastBeat > 2000) {
+                log("  ... sector " + sectorIdx + " Key " + keyLabel + ": " + tried + "/" + total + " claves probadas");
+                lastBeat = now;
+            }
+
             byte[] key = hexToBytes(hex);
             boolean ok;
             try {
