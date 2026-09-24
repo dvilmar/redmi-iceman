@@ -865,15 +865,38 @@ public class MainActivity extends Activity {
 
     private void doHardnested() {
         if (!ensureMfcReady()) return;
-        final int block = parseBlock(blockInput, 0);
+
+        String keyA = keyInput.getText().toString().trim();
+        Integer autoBlock = null;
+        if (keyA.length() != 12 && blockInput.getText().toString().trim().isEmpty() && lastResult != null) {
+            // Nothing typed for the source block/key: auto-derive it from
+            // the last autopwn result. Any sector with a known Key A works
+            // as the source (any block inside a sector authenticates the
+            // whole sector), so the user only needs to type the objective.
+            for (int s = 0; s < lastResult.length; s++) {
+                if (lastResult[s].keyA != null) {
+                    autoBlock = MifareClassic.sectorToBlock(s);
+                    keyA = lastResult[s].keyA;
+                    log("HARDNESTED: usando Key A del sector " + s + " (bloque " + autoBlock
+                            + ") como origen, ya conocida por el autopwn previo");
+                    break;
+                }
+            }
+        }
+        if (keyA.length() != 12) {
+            log("pon la Key A conocida (12 hex) en el campo de clave, o haz antes un autopwn");
+            return;
+        }
+
+        final int block = (autoBlock != null) ? autoBlock : parseBlock(blockInput, 0);
         final int trgBlock = parseBlock(trgBlockInput, block);
-        final String keyA = keyInput.getText().toString().trim();
-        if (keyA.length() != 12) { log("pon la Key A conocida (12 hex) en el campo de clave"); return; }
+        final String keyAFinal = keyA;
+        if (autoBlock != null) setBlockFields(block, trgBlock);
         log("HARDNESTED: capturando nonces contra bloque " + trgBlock + " Key B, con Key A="
-                + keyA + " en bloque " + block + " ... puede tardar");
+                + keyAFinal + " en bloque " + block + " ... puede tardar");
         new Thread(new Runnable() {
             public void run() {
-                String keyB = MfcNative.nativeHardnested(block, keyA, trgBlock);
+                String keyB = MfcNative.nativeHardnested(block, keyAFinal, trgBlock);
                 if (keyB == null) log("HARDNESTED: falló");
                 else { log("HARDNESTED: Key B = " + keyB); setKeyField(keyB); }
             }
