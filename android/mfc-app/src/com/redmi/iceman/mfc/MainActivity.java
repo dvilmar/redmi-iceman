@@ -461,20 +461,26 @@ public class MainActivity extends Activity {
         int total = 0;
         for (String ignored : tryOrder) total++;
         long startTime = System.currentTimeMillis();
-        long lastBeat = startTime;
+        long lastStatus = 0;
+        long lastLog = startTime;
         for (String hex : tryOrder) {
             tried++;
-            // Heartbeat so a stalled sweep is visible: updates the status
-            // line every key (cheap) and drops a log line every ~2s so the
-            // log itself proves it's alive without flooding it per-key.
-            // Includes measured throughput + ETA so a genuinely slow sweep
-            // (no default key on this sector -> the full ~3260-key
-            // dictionary has to be exhausted) reads as "working, N min
-            // left" instead of looking stuck.
-            setStatus("Autopwn: sector " + sectorIdx + "/" + sectorCount
-                    + " — Key " + keyLabel + ": " + tried + "/" + total);
             long now = System.currentTimeMillis();
-            if (now - lastBeat > 2000) {
+            // Heartbeat so a stalled sweep is visible -- throttled, not per
+            // key: each authenticateSectorWithKeyX() call already round-
+            // trips through Binder IPC to the NFC service, which is the
+            // real bottleneck vs. a Proxmark3's tight firmware loop (no OS
+            // IPC per key at all) and dwarfs anything this app does in
+            // between. Calling setStatus()/runOnUiThread() on every single
+            // one of up to ~3260 keys added real overhead of its own on
+            // top of that -- throttling it (and the log line) to a few
+            // times a second removes that self-inflicted cost.
+            if (now - lastStatus > 150) {
+                setStatus("Autopwn: sector " + sectorIdx + "/" + sectorCount
+                        + " — Key " + keyLabel + ": " + tried + "/" + total);
+                lastStatus = now;
+            }
+            if (now - lastLog > 2000) {
                 double elapsedSec = (now - startTime) / 1000.0;
                 double perSec = elapsedSec > 0 ? tried / elapsedSec : 0;
                 long etaSec = perSec > 0 ? (long) ((total - tried) / perSec) : -1;
@@ -482,7 +488,7 @@ public class MainActivity extends Activity {
                         "  ... sector %d Key %s: %d/%d (%.1f claves/s, ETA %dm%02ds)",
                         sectorIdx, keyLabel, tried, total, perSec,
                         etaSec < 0 ? 0 : etaSec / 60, etaSec < 0 ? 0 : etaSec % 60));
-                lastBeat = now;
+                lastLog = now;
             }
 
             byte[] key = hexToBytes(hex);
