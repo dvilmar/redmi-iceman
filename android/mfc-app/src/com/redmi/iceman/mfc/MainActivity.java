@@ -283,6 +283,13 @@ public class MainActivity extends Activity {
     private void doConnect(boolean usePtm) {
         try {
             ptmOpen = false;
+            // Reset so a stale UID from a previous session/tag can't sit
+            // next to a status line that says "waiting" -- enableReaderMode
+            // below can invoke onTagDiscovered near-immediately if a card
+            // is already resting on the phone, racing with this function's
+            // own final "esperando tarjeta" status further down.
+            lastTag = null;
+            setCard("No card");
             if (usePtm) {
                 adapter = TmsAccess.getAdapter();
                 log("OK: got ITmsNfcAdapter");
@@ -327,7 +334,10 @@ public class MainActivity extends Activity {
                     options);
             log("OK: modo lector activado — acerca una tarjeta MIFARE Classic");
             connected = true;
-            setStatus("Conectado, esperando tarjeta...");
+            // Guarded: if onTagDiscovered already fired (card was already
+            // on the phone when reader mode enabled), don't stomp its
+            // "Tarjeta detectada" status with this default one.
+            if (lastTag == null) { setStatus("Conectado, esperando tarjeta..."); }
         } catch (Exception e) {
             log("FAIL connect: " + e);
             Log.e(TAG, "connect failed", e);
@@ -410,6 +420,7 @@ public class MainActivity extends Activity {
                         // usable one, so clear it rather than let every
                         // retry fail the same way.
                         lastTag = null;
+                        setCard("No card (referencia caducada)");
                         setStatus("Tarjeta caducada -- vuelve a acercarla");
                         log("AUTOPWN: la referencia a la tarjeta ha caducado (\"" + e.getMessage()
                                 + "\"). Separa y vuelve a acercar la tarjeta, luego pulsa el "
