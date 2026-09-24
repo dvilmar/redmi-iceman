@@ -197,6 +197,15 @@ public class MainActivity extends Activity {
         setContentView(outer);
     }
 
+    @Override
+    protected void onDestroy() {
+        // Don't leave the vendor HAL stuck in passthrough mode if the app
+        // is killed/backgrounded while PTM is open -- same reasoning as
+        // closePtmIfOpen() above.
+        closePtmIfOpen();
+        super.onDestroy();
+    }
+
     // ---- UI helpers ------------------------------------------------------
 
     private void addHeader(LinearLayout root, String text) {
@@ -280,9 +289,26 @@ public class MainActivity extends Activity {
         }).start();
     }
 
+    // Closes any previously-open PTM channel. Switching from "Conectar con
+    // PTM" back to "Conectar (modo lector)" (or just reconnecting with PTM
+    // again) used to leave the old ptmTransport's Binder channel open --
+    // the vendor HAL stays in passthrough mode and never resumes normal
+    // polling, so onTagDiscovered stops firing for good until the process
+    // is killed. mfcInited is also cleared: nativeInit() cached a global
+    // ref to the OLD PtmTransport instance, which is now closed/replaced,
+    // so the native side must be re-initialized against the new one.
+    private void closePtmIfOpen() {
+        if (ptmTransport != null) {
+            ptmTransport.close();
+            ptmTransport = null;
+        }
+        ptmOpen = false;
+        mfcInited = false;
+    }
+
     private void doConnect(boolean usePtm) {
         try {
-            ptmOpen = false;
+            closePtmIfOpen();
             // Reset so a stale UID from a previous session/tag can't sit
             // next to a status line that says "waiting" -- enableReaderMode
             // below can invoke onTagDiscovered near-immediately if a card
